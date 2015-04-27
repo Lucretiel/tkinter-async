@@ -3,8 +3,6 @@ from tkinter_async import *
 import asyncio
 from functools import partial
 
-patch_Tk()
-
 def make_submitter(root, label, button_text, callback_coro, respawn=Respawn.CONCURRENT):
     frame = tkinter.Frame(root)
 

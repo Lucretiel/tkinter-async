@@ -275,6 +275,8 @@ def timed_section(interval, result=None, *, loop=None):
             yield from delay
 
     '''
+
+    # This mirrors very closely the implementation of asyncio.sleep.
     waiter = asyncio.Future(loop=loop)
 
     def done():
@@ -356,9 +358,10 @@ def async_mainloop(
         loop = asyncio.get_event_loop()
         loop.run_until_complete(run_tk_app())
     '''
-    # If root is not an AsyncTk, patch it to support the _destroyed attribute.
-    # This is required so that the event loop knows when to terminate.
-    if not isinstance(root, AsyncTk):
+    # If root is not an AsyncTk and hasn't been previously patched, patch it to
+    # support the _destroyed attribute. This is required so that the event loop
+    # knows when to terminate.
+    if not hasattr(root, '_destroyed'):
         root._destroyed = False
         original_destroy = root.destroy
 

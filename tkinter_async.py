@@ -24,6 +24,9 @@ from functools import wraps
 import tkinter
 
 
+_DONT_WAIT = tkinter._tkinter.DONT_WAIT
+
+
 __all__ = []
 
 
@@ -33,9 +36,6 @@ def export(thing):
     '''
     __all__.append(thing.__name__)
     return thing
-
-
-_DONT_WAIT = tkinter._tkinter.DONT_WAIT
 
 
 # if tkinter.DEBUG is False, no debug popups will be created from `spawn`
@@ -54,31 +54,6 @@ def getloop(func):
             loop = asyncio.get_event_loop()
         return func(*args, loop=loop, **kwargs)
     return wrapper
-
-
-@export
-class AsyncTk(tkinter.Tk):
-    '''
-    This class enables compatibility of tkinter.Tk root objects with the async
-    mainloop. It is designed to be a drop-in replacement for tkinter.Tk, and is
-    as non-instrusive as possible; all old blocking methods (mainloop, update,
-    etc.) are left in place. The only change is that an AsyncTk instance is
-    aware that its .destroy() has been called; async_mainloop uses this to
-    determine when to stop the loop.
-    '''
-    def __init__(self, *args, loop=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._destroyed = False
-
-    @wraps(tkinter.Tk.destroy)
-    def destroy(self):
-        if not self._destroyed:
-            super().destroy()
-            self._destroyed = True
-
-    @property
-    def destroyed(self):
-        return self._destroyed
 
 
 @export

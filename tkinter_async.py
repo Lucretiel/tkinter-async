@@ -81,13 +81,6 @@ class AsyncTk(tkinter.Tk):
         return self._destroyed
 
 
-
-@export
-def patch_Tk():
-    '''Replace tkinter.Tk with the AsyncTk wrapper class.'''
-    tkinter.Tk = AsyncTk
-
-
 @export
 @contextmanager
 def scoped_window(*args, ignore_destroyed=True, **kwargs):

@@ -326,9 +326,10 @@ def async_mainloop(
         loop = asyncio.get_event_loop()
         loop.run_until_complete(run_tk_app())
     '''
-    # If root is not an AsyncTk and hasn't been previously patched, patch it to
-    # support the _destroyed attribute. This is required so that the event loop
-    # knows when to terminate.
+    # patch root to support the _destroyed attribute, which is set when the
+    # destroy method is called. This is required so that the event loop knows
+    # when to terminate, since there is no other way to determine if a window
+    # has been destroyed.
     if not hasattr(root, '_destroyed'):
         root._destroyed = False
         original_destroy = root.destroy
@@ -356,6 +357,7 @@ def async_mainloop(
 
     root.protocol("WM_DELETE_WINDOW", quit_callback)
 
+    # Run the actual mainloop
     try:
         while not root._destroyed:
             with timed_section(interval, loop=loop) as delay:
@@ -365,6 +367,7 @@ def async_mainloop(
     finally:
         if not root._destroyed and destroy_on_exit:
             root.destroy()
-
+        
+        # Run one final update cycle, to ensure the destroy() event is handled
         if root._destroyed:
             yield from update_root(root)

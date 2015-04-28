@@ -249,7 +249,7 @@ def timed_section(interval, result=None, *, loop=None):
 
     def done():
         if not waiter.cancelled():
-            waiter.set_result(None)
+            waiter.set_result(result)
 
     handle = loop.call_later(interval, done)
 

@@ -234,7 +234,7 @@ def update_root(root):
 def timed_section(interval, result=None, *, loop=None):
     '''
     This context manager forces a context to take at least a certain amount of
-    time, starting from when the context is entered. It yields a future which
+    time, starting from when the context is *entered*. It yields a future which
     should be yielded from at the end of the context. It allows you to turn
     this:
 

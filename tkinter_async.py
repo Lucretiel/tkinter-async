@@ -58,13 +58,14 @@ def getloop(func):
 
 @export
 @contextmanager
-def scoped_window(*args, ignore_destroyed=True, **kwargs):
+def scoped_window(*args, ignore_destroyed=True, loop=None, **kwargs):
     '''
-    This context manager creates a tkinter.Toplevel popup and destroys it at
-    the end of the context. In plain Tk this really isn't possible, because it
-    exclusively uses callbacks to manage events. However, with coroutines, it's
-    possible to simply contrain the lifespan of an object to that of the
-    coroutine, significantly simplifying the design of the application.
+    This context manager creates a tkinter.Toplevel popup and a future for the
+    context. The future completes when the popup is exited; the popup is
+    destroyed at the end of the context. In plain Tk this really isn't possible,
+    because it exclusively uses callbacks to manage events. However, with
+    coroutines, it's possible to simply contrain the lifespan of an object to that
+    of the coroutine, significantly simplifying the design of the application.
 
     If `ignore_destroyed` is True (the default), exceptions raised during the
     destroy are ignored. This is because, in some cases, destroying an object
@@ -74,18 +75,23 @@ def scoped_window(*args, ignore_destroyed=True, **kwargs):
 
         @asyncio.coroutine
         def temp_popup(master, text, interval):
-            # Create a temporary popup.
-            with scoped_window(master) as popup:
+            with scoped_window(master) as popup, waiter:
                 label = tkinter.Frame(window, text=text)
                 label.grid()
-                yield from asyncio.sleep(interval)
-                # window is destroyed at the end of the context, and the event
-                # loop can proceed during the asyncio.sleep.
+                yield from waiter
+                # Window runs until the end of the context. The context will
+                # end when the user closes the window, or when the coroutine is
+                # cancelled.
     '''
     popup = tkinter.Toplevel(*args, **kwargs)
+    waiter = asyncio.Future(loop=loop)
+    
+    popup.protocol('WM_DELETE_WINDOW', partial(waiter.set_result, None))
+        
     try:
-        yield popup
+        yield popup, waiter
     finally:
+        waiter.cancel()
         try:
             popup.destroy()
         except tkinter.TclException:

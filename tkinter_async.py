@@ -86,7 +86,7 @@ def scoped_window(*args, ignore_destroyed=True, loop=None, **kwargs):
     popup = tkinter.Toplevel(*args, **kwargs)
     waiter = asyncio.Future(loop=loop)
     
-    popup.protocol('WM_DELETE_WINDOW', partial(waiter.set_result, None))
+    popup.protocol('WM_DELETE_WINDOW', lambda: waiter.set_result(None))
         
     try:
         yield popup, waiter

@@ -373,7 +373,7 @@ def async_mainloop(
     finally:
         if not root._destroyed and destroy_on_exit:
             root.destroy()
-        
+
         # Run one final update cycle, to ensure the destroy() event is handled
         if root._destroyed:
             yield from update_root(root)

@@ -16,12 +16,16 @@
 # Copyright 2015 Nathan West
 
 
-from contextlib import contextmanager
 import asyncio
-import enum
-from traceback import format_exc
-from functools import wraps
 import tkinter
+
+from contextlib import contextmanager
+from contextlib import suppress
+from enum import Enum
+from functools import partial
+from functools import wraps
+from itertools import count
+from traceback import format_exc
 
 
 _DONT_WAIT = tkinter._tkinter.DONT_WAIT
@@ -38,9 +42,9 @@ def export(thing):
     return thing
 
 
-# if tkinter.DEBUG is False, no debug popups will be created from `spawn`
-# coroutines (by default)
-DEBUG = True
+# if tkinter.DEBUG_POPUPS is False, no debug popups will be created from
+# `spawn` coroutines by default.
+DEBUG_POPUPS = True
 
 
 def getloop(func):
@@ -49,58 +53,76 @@ def getloop(func):
     look up the loop with asyncio.get_event_loop() when called, if it's None.
     '''
     @wraps(func)
-    def wrapper(*args, loop=None, **kwargs):
+    def getloop_wrapper(*args, loop=None, **kwargs):
         if loop is None:
             loop = asyncio.get_event_loop()
         return func(*args, loop=loop, **kwargs)
     return wrapper
 
 
+def popup_exc(master=None, title="Uncaught exception"):
+    '''
+    This function must *only* be called when handling an exception. When
+    called, it creates and returns tkinter popup window with the exception
+    traceback.
+    '''
+    window = tkinter.Toplevel(master)
+    window.title(title)
+    tkinter.Label(window, text=format_exc(), justify=tkinter.LEFT).grid()
+    return window
+
+
 @export
 @contextmanager
-def scoped_window(*args, ignore_destroyed=True, loop=None, **kwargs):
+def popup_uncaught(master=None, title="Uncaught exception", Base=Exception):
     '''
-    This context manager creates a tkinter.Toplevel popup and a future for the
-    context. The future completes when the popup is exited; the popup is
-    destroyed at the end of the context. In plain Tk this really isn't possible,
-    because it exclusively uses callbacks to manage events. However, with
-    coroutines, it's possible to simply contrain the lifespan of an object to that
-    of the coroutine, significantly simplifying the design of the application.
-
-    If `ignore_destroyed` is True (the default), exceptions raised during the
-    destroy are ignored. This is because, in some cases, destroying an object
-    more than once results in a TclException being raised.
-
-    Example:
-
-        @asyncio.coroutine
-        def temp_popup(master, text, interval):
-            with scoped_window(master) as popup, waiter:
-                label = tkinter.Frame(window, text=text)
-                label.grid()
-                yield from waiter
-                # Window runs until the end of the context. The context will
-                # end when the user closes the window, or when the coroutine is
-                # cancelled.
+    This context manager creates a traceback popup, using the popup_exc
+    function, if an exception leaves it. Base controls the base exception class
+    to check for; other exceptions will be unreported.
     '''
-    popup = tkinter.Toplevel(*args, **kwargs)
-    waiter = asyncio.Future(loop=loop)
-    
-    popup.protocol('WM_DELETE_WINDOW', lambda: waiter.set_result(None))
-        
     try:
-        yield popup, waiter
-    finally:
-        waiter.cancel()
-        try:
-            popup.destroy()
-        except tkinter.TclException:
-            if not ignore_destroyed:
-                raise
+        yield
+    except Base:
+        popup_exc(master, title)
+        raise
 
 
 @export
-class Respawn(enum.Enum):
+class WaitableToplevel(tkinter.Toplevel, asyncio.Future):
+    def __init__(self, *args, loop=None, **kwargs):
+        tkinter.Toplevel.__init__(self, *args, **kwargs)
+        asyncio.Future.__init__(self, loop=loop)
+
+        # By default, closing the window calls self.destroy. This completes
+        # the future and destroyes the Toplevel widget.
+        self.protocol('WM_DELETE_WINDOW', self.destroy)
+
+        # When the future is completed- either it is completed by self.destroy,
+        # canceled by __exit__, or canceled externally, destroy the Toplevel
+        # widget
+        self.add_done_callback(super().destroy)
+
+    def destroy(self):
+        '''
+        Destory the widget, by completing the Future. This triggers the "done"
+        callback which actually destroys the widget.
+        '''
+        if not self.done():
+            self.set_result(None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        '''
+        When the context is exited, cancel the future. This triggers the done
+        coroutine, which actually destroys the widget.
+        '''
+        self.cancel()
+
+
+@export
+class Respawn(Enum):
     '''
     These are the different respawn behaviors implemented by the `spawn`
     function.
@@ -108,36 +130,51 @@ class Respawn(enum.Enum):
     CONCURRENT = 0
     CANCEL = 1
     SKIP = 2
+    QUEUE = 3
 
+
+def debug_popup_callback(fut):
+    '''
+    This callback is attached by `spawn` to the spawned task, to create a popup
+    window with the stack trace in the event the task raised an exception. The
+    exception is reraised (except a CancelledError) so that a stack trace also
+    appears in the CLI.
+    '''
+    with popup_uncaught():
+        try:
+            fut.result()
+        except asyncio.CancelledError:
+            pass
 
 @export
 @getloop
 def spawn(coro=None, *args, respawn=Respawn.CONCURRENT, debug=None, loop=None):
     '''
     This function creates a callback, suitable for use as a Widget or protocol
-    callback, which spawns a coroutine asynchronously. Optionally, pass some
-    arguments that will be passed to the coroutine when it is invoked; for more
-    complex cases (like kwargs), use a locally defined coroutine, lambda, or
-    functools.partial to capture the data you need.
+    callback, which spawns a coroutine when called. Optionally, pass some
+    positional arguments that will be passed to the coroutine when it is
+    invoked.
+
+    The callback returned by spawn also takes *args and **kwargs. If given,
+    they will be used *after* spawn's *args. This allows spawn callbacks to be
+    used as event handlers, or in other contexts outside of tkinter:
+
+        cb = spawn(coro, 1, 2)
+        cb(3, 4)  # create a task for coro(1,2,3,4)
 
     The respawn parameter controls what happens in the event that the callback
     is invoked while a coroutine previously scheduled by this callback is still
     running:
 
-    - Respawn.CONCURRENT: Simply schedule a second instance of the coroutine.
+    - Respawn.CONCURRENT: Simply launch a second instance of the coroutine.
       This is the default.
-    - Respawn.CANCEL: Cancel the old coroutine and start a new one.
-    - Respanw.SKIP: Do not schedule a new coroutine.
+    - Respawn.CANCEL: Cancel the old coroutine and launch a new one.
+    - Respawn.SKIP: Do not launch a new coroutine.
+    - Respawn.QUEUE: Lauch a new coroutine when the previous one finishes.
 
     If `debug` is True, a small popup will be created with a stack trace if an
     Exception is raised from the coroutine. asyncio.CancelledError exceptions
-    are ignored. If it is not given, it defaults to tkinter_async.DEBUG.
-
-    This function can also be used as a decorator. In that case, it converts
-    the coroutine into the callback. Keep in mind that a single callback
-    maintains only a single running task for SKIP or CANCEL; if you want
-    separate callbacks with the same coroutine, with independant SKIP or
-    CANCEL, call spawn each time.
+    are ignored. If it is not given, it defaults to tkinter_async.DEBUG_POPUPS.
 
     Examples:
         @asyncio.coroutine
@@ -146,69 +183,54 @@ def spawn(coro=None, *args, respawn=Respawn.CONCURRENT, debug=None, loop=None):
 
         button = tkinter.Button(..., command=spawn(my_coroutine))
 
-        @spawn
-        @asyncio.coroutine
-        def my_coroutine2():
-            ...
-
-        button2 = tkinter.Button(command=my_coroutine2)
-
-        @spawn(respawn=Respawn.SKIP)
-        @asyncio.coroutine
-        def my_coroutine3():
-            ...
-
-        button3 = tkinter.Button(command=my_coroutine3)
-
     '''
-    # Decorator-with-arguments variant
-    if coro is None:
-        return lambda coro: spawn(
-            coro, *args, respawn=respawn, debug=debug, loop=loop)
 
-    # Exception traceback popup window
-    if debug or (debug is None and DEBUG):
-        @asyncio.coroutine
-        def coro_wrapper():
-            try:
-                yield from coro(*args)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                window = tkinter.Toplevel()
-                window.title("Exception raised from spawned coroutine")
-                label = tkinter.Label(
-                    window,
-                    text=format_exc(),
-                    justify=tkinter.LEFT)
-                label.grid()
-                raise
+    def spawn_coro(more_args, kwargs):
+        '''
+        Create and return a new task, running coro with args, more_args, and
+        kwargs. If debug mode is enabled, attach a callback which will create a
+        popup with the stack trace in the event of an exception.
+        '''
+        task = loop.create_task(coro(*(args + more_args), **kwargs))
+        if debug or (debug is None and DEBUG_POPUPS):
+            task.add_done_callback(debug_popup_callback)
+        return task
 
-    else:
-        @asyncio.coroutine
-        def coro_wrapper():
-            yield from coro(*args)
-
-    def spawn_coro():
-        return asyncio.async(coro_wrapper(), loop=loop)
-
-    task = None
     if respawn is Respawn.CONCURRENT:
-        def callback():
-            spawn_coro()
+        def callback(*args, **kwargs):
+            spawn_coro(args, kwargs)
 
     elif respawn is Respawn.CANCEL:
-        def callback():
-            nonlocal task
-            if task is not None:
-                task.cancel()
-            task = spawn_coro()
+        running_task = None
+        def callback(*args, **kwargs):
+            nonlocal running_task
+            if running_task is not None:
+                running_task.cancel()
+            running_task = spawn_coro(args, kwargs)
 
     elif respawn is Respawn.SKIP:
-        def callback():
-            nonlocal task
-            if task is None or task.done():
-                task = spawn_coro()
+        running_task = None
+        def callback(*args, **kwargs):
+            nonlocal running_task
+            if running_task is None or running_task.done():
+                running_task = spawn_coro(args, kwargs)
+
+    elif respawn is Respawn.QUEUE:
+        queue = asyncio.Queue(loop=loop)
+
+        @asyncio.coroutine
+        def queue_watcher():
+            while True:
+                waiter = asyncio.Future(loop=loop)
+                args, kwargs = yield from queue.get()
+                spawn_coro(args, kwargs).add_done_callback(waiter.set_result)
+                yield from waiter
+
+        loop.create_task(queue_watcher())
+
+        def callback(*args, **kwargs):
+            queue.put_nowait((args, kwargs))
+
     else:
         raise TypeError("respawn must be a Respawn Enum", respawn)
 
@@ -224,6 +246,9 @@ def update_root(root):
     the queue, then returns, allowing the caller to do other tasks or sleep
     afterwards. This keeps CPU load low. Generally clients will never need to
     call this function; it should only be used internally by async_mainloop.
+
+    Bear in mind that many single events will actually block indefinitely, such
+    as dragging, scrolling, or resizing a window.
     '''
     while root.tk.dooneevent(_DONT_WAIT):
         yield
@@ -233,7 +258,7 @@ def update_root(root):
 @contextmanager
 def timed_section(interval, result=None, *, loop=None):
     '''
-    This context manager forces a context to take at least a certain amount of
+    This context manager allows a context to take at least a certain amount of
     time, starting from when the context is *entered*. It yields a future which
     should be yielded from at the end of the context. It allows you to turn
     this:
@@ -250,7 +275,9 @@ def timed_section(interval, result=None, *, loop=None):
 
     '''
 
-    # This mirrors very closely the implementation of asyncio.sleep.
+    # This mirrors very closely the implementation of asyncio.sleep. We use the
+    # future and call_later explicitly (rather than reusing asyncio.sleep) to
+    # ensure the timer is started right when the context is entered
     waiter = asyncio.Future(loop=loop)
 
     def done():
@@ -278,27 +305,26 @@ def async_mainloop(
         loop=None):
     '''
     This coroutine replaces root.mainloop() in your tkinter application. Run it
-    in the asyncio event loop to run your application alongside the loop. This
+    in the asyncio event loop to run your application inside the loop. This
     allows you to reap the benefits of asyncio- networking, coroutines, etc- in
     your tkinter application. It is designed so that the UI is as responsive as
-    possible, without ever blocking the event loop; the coroutine yields back
+    possible, without ever blocking the event loop*; the coroutine yields back
     to the asyncio event loop between each individual UI event, giving it the
     opportunity to run other tasks as necessary. By default, it polls the Tk
     event queue at least 20 times per second; This keeps the app responsive
     while keeping CPU load low.
 
-    This coroutine alters the root in two ways. First, if root is *not* an
-    instance of AsyncTk, it is minimally patched such that calling destroy can
-    be detected by the loop. Second, a new WM_DELETE_WINDOW exit handler is
-    installed, to ensure the new destroy method (or AsyncTk's destroy method)
-    is called. See the `quit_coro` paramter for how to install your own exit
-    handler.
+    This coroutine alters the root in two ways. First, it is minimally patched
+    such that calling destroy can be detected by the loop. Second, a new
+    WM_DELETE_WINDOW exit handler is installed, to ensure the new destroy
+    method is called. See the `quit_coro` paramter for how to install your own
+    exit handler.
 
     The `interval` parameter controls how long the loop sleeps between polling
     tkinter's event queue. Note that, when there are events in the queue, they
     are all handled with a yield between each but without a sleep; the interval
     parameter only controls how long the loop sleeps for when idle. This means
-    that during event-heavy periods (initial load, new widgets, and resize) the
+    that during event-heavy periods (initial load, new widgets, etc) the
     interface remains as responsive as possible, without actually blocking
     asyncio, but when the interface is idle CPU load remains low.
 
